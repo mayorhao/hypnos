@@ -58,7 +58,7 @@ def synthetic_ecg(fs, duration, rng):
     ecg = np.zeros_like(t)
     half = int(0.1 * fs)
     for b in beats:  # add each complex locally (O(beats), not O(beats * samples))
-        c = int(round(b * fs))
+        c = round(b * fs)
         sl = slice(max(c - half, 0), min(c + half, t.size))
         tt = t[sl] - b
         ecg[sl] += 1000 * np.exp(-0.5 * (tt / 0.012) ** 2) - 150 * np.exp(-0.5 * ((tt - 0.03) / 0.015) ** 2)
@@ -128,7 +128,7 @@ def test_r_peaks_and_rr():
     r = detect_r_peaks(ecg, 256) / 256
     matched = np.min(np.abs(r[:, None] - beats[None, :]), axis=0)
     assert np.mean(matched < 0.01) > 0.98, np.mean(matched < 0.01)
-    rr_sec, n_beats, rmssd, valid = rr_descriptors(r, 120)
+    rr_sec, _n_beats, rmssd, valid = rr_descriptors(r, 120)
     assert np.isfinite(rr_sec).mean() > 0.95
     assert abs(np.nanmedian(rr_sec) - np.median(np.diff(beats))) < 0.05
     assert rmssd.shape == (120 // EPOCH_SEC,) and np.isfinite(rmssd).all()

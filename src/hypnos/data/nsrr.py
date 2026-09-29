@@ -222,8 +222,9 @@ def detect_r_peaks(ecg: np.ndarray, fs: int) -> np.ndarray:
     """R-peak sample indices at the native rate (Pan-Tompkins-style energy detector).
 
     Polarity is inferred from the skewness of the QRS-band signal, so inverted leads work.
-    Uses zero-phase filtering: R-peak *times* are local, and descriptors built on them are
-    evaluated per second, so the few-ms lookahead does not leak across tokens.
+    This is an offline detector: zero-phase filtering, whole-record polarity estimation,
+    and blockwise thresholds use future samples. The resulting descriptors must not be
+    treated as causal inputs for streaming or future-prediction evaluation.
     """
     ecg = np.nan_to_num(np.asarray(ecg, dtype=np.float64))
     sos = butter(3, [5.0, min(20.0, 0.45 * fs)], btype="bandpass", fs=fs, output="sos")
@@ -256,8 +257,9 @@ def rr_descriptors(
 
     Returns ``(rr_sec, beats, rmssd_ms, valid_rr)``:
       * ``rr_sec`` (n_seconds,): last valid RR interval ending within second ``t`` or the
-        preceding ``max_gap_sec`` (causal), NaN otherwise. Heart rate is 60 / rr, so it is
-        not stored separately.
+        preceding ``max_gap_sec``, NaN otherwise. The assignment uses only preceding
+        intervals, but validity uses a centered median filter and is not causal.
+        Heart rate is 60 / rr, so it is not stored separately.
       * ``beats`` (n_seconds,): number of R-peaks in each second.
       * ``rmssd_ms`` (n_seconds // 30,): RMSSD over valid successive NN pairs per epoch.
       * ``valid_rr`` (len(r_times) - 1,): physiological-range and local-median plausibility.
@@ -512,7 +514,7 @@ def _process_one(edf: Path, xml: Path | None, out_dir: Path, kwargs: dict) -> di
             row["modalities"] = " ".join(sorted(meta["modalities"]))
             for m in meta["modalities"]:
                 row[f"good_frac.{m}"] = round(float((d[f"{m}.qc"] == 0).mean()), 4)
-    except Exception as e:  # keep the batch going; the manifest records the failure
+    except Exception as e:  # noqa: BLE001 - record per-file failures and continue the batch
         row["status"] = f"error: {type(e).__name__}: {e}"
     return row
 
