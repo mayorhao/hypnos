@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from hypnos.data.preprocessing import causal_preprocess_signal  # noqa: E402
+from hypnos.data.preprocessing import causal_preprocess_signal
 
 rng = np.random.default_rng(0)
 
