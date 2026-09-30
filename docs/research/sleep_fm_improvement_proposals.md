@@ -4,6 +4,7 @@
 > **约束**：复用 Hypnos 的两个核心概念：(1) per-modality tokenizer；(2) per-second motif。
 > **范围**：从 Hypnos 已借鉴的语音、文本领域，以及视觉、时间序列、生物序列建模中，引入与 Hypnos 有差异、且有潜力成为创新点的方案，逐一评估创新性与可行性，并给出参考文献与可行性证据。
 > **日期**：2026-09-28
+> **后续版本**：[`sleep_fm_hypothesis_generation_v2.md`](sleep_fm_hypothesis_generation_v2.md)（2026-09-30）补充了领域级失败模式分析（F1-F12）与以语义 motif 为中心的 12 个方案（P1-P12），并给出与本文方案的映射（其 5.3 节）。
 
 **证据来源说明**
 
