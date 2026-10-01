@@ -304,6 +304,11 @@ k-means 设置：`sklearn.cluster.MiniBatchKMeans(n_clusters=K, batch_size=10000
   "T3": {"pass": "retention = delta(A+S_hat) / delta(A+S) >= 0.7 on every task that passed T2"},
   "T4": {
     "min_nights_for_decision": 1000,
+    "descriptor_normalization": "per-night robust z, then global z on training folds (section 3.3)",
+    "S_occ_dims": 8,
+    "S_occ_dims_sensitivity": 32,
+    "score_clipping": "clip test-fold S_occ PCA scores to the training-fold [min, max]",
+    "night_qc": "flag nights whose median rolling sigma > 2x the cohort median or with < 50% valid seconds; main analysis keeps them, sensitivity analysis excludes them",
     "pass": "delta R2 (M1 minus M0) > 0 with 95% CI excluding 0 for age OR log(1+AHI)"
   },
   "T5": {"pass": "predicted delta-band MSC under the 1+7 configuration >= 0.95 after calibration"}
@@ -445,9 +450,13 @@ def waterfill_msc(f, S, rate_bits_per_s, bands):
 | B1 分期汇总 | 总睡眠时间、睡眠效率、入睡后清醒时间、入睡潜伏期、REM 潜伏期、各期占比（5）、每小时分期转换次数、各期平均持续时长（5） |
 | B2 频谱汇总 | 整夜与 NREM 的 7 个频带平均对数功率和相对功率；NREM 平均谱在 2-30 Hz 上拟合的非周期指数 |
 | B3 Hypnos 嵌入 | eeg_c3 的 1 Hz 嵌入在睡眠期与 N2 内的均值，拼接后 PCA 到 32 维（训练折拟合） |
-| S_occ | `S_band`（K = 128）码在睡眠期的占比，加 N2 内的条件占比；取平方根后 PCA 到 32 维（训练折拟合） |
+| S_occ | `S_band`（K = 128）码在睡眠期的占比，加 N2 内的条件占比；取平方根后 PCA 到 8 维（训练折拟合；32 维作敏感性分析）。测试折的 PCA 得分截断到训练折的取值范围 |
 
 **模型**：岭回归，alpha 用内层受试者 5 折选择，外层使用第 2 节的 5 折。
+
+**描述子归一化**：严格按第 3.3 节，先每夜稳健标准化，再全局标准化。只做全局标准化时，单个增益异常的夜会落入训练夜几乎不用的码，使占比向量极端化，岭回归随之外推；一次 200 夜的预实验中，一夜幅度约为常规 2 倍的记录就让年龄的 ΔR² 跌到 -0.4。
+
+**夜级质控**：标记滚动标准差中位数超过本队列中位数 2 倍、或有效秒少于 50% 的夜。主分析保留这些夜，敏感性分析剔除后重算，两者都报告。
 
 **比较**：
 
