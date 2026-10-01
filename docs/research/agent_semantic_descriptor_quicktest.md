@@ -2,7 +2,7 @@
 
 > 用途：把本文件整体交给执行 agent。它规定描述子的精确定义、每个实验的设置、预注册的通过标准和输出格式。
 > 背景：实验 1.2 发现 Hypnos 的 8 级 RVQ token（`eeg-q8-causal`，码本 2048，约 88 bit/s）在 alpha 及以上频段丢失信息，纺锤波事件级 F1 只有 0.76。计划在 split RVQ 中加入 HuBERT 式语义层：第一轮用逐秒描述子做 k-means 得到伪标签，再让语义分支对齐这些目标。本任务在不训练任何神经网络的前提下，判断这个方向是否值得推进。
-> 版本：2026-09-30；2026-10-01 增加附录 A（癫痫语义描述子 E1-E6）
+> 版本：2026-09-30；2026-10-01 增加第 11 维 so_contrast（K 复合波）与附录 A（癫痫语义描述子 E1-E6，可选）
 
 ---
 
@@ -83,7 +83,7 @@ x_uV[n] = x_proc[n] * exp(log_scale[t]),  t = floor(n / 128)
 
 ### 3.2 描述子定义
 
-每个通道每秒一个 10 维向量。前 7 维称为 `D_band`，全部 10 维称为 `D_full`。
+每个通道每秒一个 11 维向量。前 7 维称为 `D_band`，全部 11 维称为 `D_full`。
 
 | 维 | 名称 | 定义 | 窗口 |
 |---|---|---|---|
@@ -97,11 +97,13 @@ x_uV[n] = x_proc[n] * exp(log_scale[t]),  t = floor(n / 128)
 | 8 | rel_sigma | 11-16 Hz 功率与 1-30 Hz 功率之比（线性） | 2 s 尾随窗，同上 |
 | 9 | sigma_corr_max | 秒内各 0.3 s 子窗（步长 0.1 s）上，11-16 Hz 滤波信号与 1-30 Hz 滤波信号的 Pearson 相关，取最大值 | 子窗终点落在该秒内 |
 | 10 | sigma_rms_max | 同样的子窗上，11-16 Hz 滤波信号 RMS 的 log10，取最大值 | 同上 |
+| 11 | so_contrast | 0.3-2 Hz 零相位带通信号在过去 1.5 s 内的峰峰值，除以该量在过去 30 s 的中位数，取 log10 | 1.5 s 尾随窗，30 s 背景 |
 
 说明：
 
 - 频段划分与实验 1.2 一致（alpha 8-11 Hz、sigma 11-16 Hz），sigma 再分为慢与快两段；0.5-1.25 Hz 单列，是 Sleep2.0 区分 N2 亚状态时发现差异的频段。
 - 低频用 4 s 窗，是因为 2 s 窗的频率分辨率不足以估计慢振荡与 delta。
+- 第 11 维表示慢波的孤立程度，对应 AASM 对 K 复合波"从背景中突出"的定义。频带功率只反映慢波活动的多少，区分不了"一个孤立的大慢波"与"连续中等幅度的慢波"：合成测试中，K 复合波对过渡期连续慢波的可分性，so 与 delta 频带功率分别只有 0.81 和 0.66（且方向相反），so_contrast 为 1.00；对 N2 背景，频带功率为 0.82，so_contrast 为 0.99。在 N3 中背景本身就是慢波，so_contrast 接近 0。
 - 第 9、10 维的定义与 YASA 纺锤波检测判据一致。它们必须用零相位滤波（`sosfiltfilt`）：若对两个频带分别使用因果滤波，两者在 13 Hz 处的相位延迟不同，会系统性压低相关系数（参考实现的测试中，纺锤波期间相关从 0.97 降到 0.46）。零相位滤波带来约数百毫秒的前瞻。描述子只作训练目标，推理时不需要，这一前瞻可以接受，在 README 中注明即可。
 - **不放入描述子**：`log_scale`（绝对幅度）与非周期偏移。它们属于非周期流或每夜身份信息，不属于语义层。
 
@@ -168,16 +170,27 @@ def spindle_shape(x, n_seconds, fs=FS, win_s=0.3, step_s=0.1):
     return corr_max, rms_max
 
 
+def so_contrast(x, n_seconds, fs=FS, win_s=1.5, bg_s=30):
+    """log10(peak-to-peak of the 0.3-2 Hz signal over the trailing 1.5 s / its median over the trailing 30 s)."""
+    x = np.asarray(x[: n_seconds * fs], dtype=np.float64)
+    xs = sosfiltfilt(butter(2, [0.3, 2.0], "bandpass", fs=fs, output="sos"), x)
+    w = int(win_s * fs)
+    p2p = np.array([np.ptp(xs[max(0, (t + 1) * fs - w) : (t + 1) * fs]) for t in range(n_seconds)])
+    bg = np.array([np.median(p2p[max(0, t - bg_s + 1) : t + 1]) for t in range(n_seconds)])
+    return np.log10(p2p / (bg + 1e-9)).astype(np.float32)
+
+
 def descriptors(x_uv, n_seconds, fs=FS):
-    """D_band (n, 7) and D_full (n, 10). Columns: so, delta, theta, alpha, sigma_slow, sigma_fast, beta,
-    rel_sigma, sigma_corr_max, sigma_rms_max."""
+    """D_band (n, 7) and D_full (n, 11). Columns: so, delta, theta, alpha, sigma_slow, sigma_fast, beta,
+    rel_sigma, sigma_corr_max, sigma_rms_max, so_contrast."""
     low = mt_band_logpow(x_uv, n_seconds, 4.0, 2.0, LOW_BANDS, fs)
     high = mt_band_logpow(x_uv, n_seconds, 2.0, 1.5, HIGH_BANDS, fs)
     rel = mt_band_logpow(x_uv, n_seconds, 2.0, 1.5, {"sigma": (11.0, 16.0), "total": (1.0, 30.0)}, fs)
     rel_sigma = 10 ** (rel[:, 0] - rel[:, 1])
     corr_max, rms_max = spindle_shape(x_uv, n_seconds, fs)
     d_band = np.concatenate([low, high], 1)
-    d_full = np.concatenate([d_band, rel_sigma[:, None], corr_max[:, None], rms_max[:, None]], 1)
+    sc = so_contrast(x_uv, n_seconds, fs)
+    d_full = np.concatenate([d_band, rel_sigma[:, None], corr_max[:, None], rms_max[:, None], sc[:, None]], 1)
     return d_band.astype(np.float32), d_full.astype(np.float32)
 
 
@@ -199,7 +212,7 @@ def per_night_robust_z(D, valid, clip=5.0):
 |---|---|---|
 | `D_raw` | 4 s 尾随窗多窗谱的 log10 功率，在 1-30 Hz 内按 1 Hz 取平均（29 维），只做全局逐维标准化，不做每夜标准化 | 近似"直接用 P(f) 向量"的做法 |
 | `D_epoch30`（可选） | 每个 30 s epoch 的 log10 Welch 功率谱（4 s Hann 窗），0.5-30 Hz 按 1 Hz 取平均，赋给该 epoch 的每一秒，全局标准化 | 近似 Sleep2.0 第一轮的时间分辨率 |
-| `D_full+fast`（消融） | `D_full` 与"`D_full` 减去其 60 s 尾随滑动中位数"拼接，共 20 维 | 检验快慢分解能否避免聚成分期码 |
+| `D_full+fast`（消融） | `D_full` 与"`D_full` 减去其 60 s 尾随滑动中位数"拼接，共 22 维 | 检验快慢分解能否避免聚成分期码 |
 
 ### 3.5 离散化
 
@@ -236,6 +249,7 @@ k-means 设置：`sklearn.cluster.MiniBatchKMeans(n_clusters=K, batch_size=10000
    - alpha 在 W 最高；
    - beta 在 W 高于 N2 和 N3。
 3. **纺锤波判别**：在 N2 秒中，YASA 纺锤波阳性秒与阴性秒的 sigma_corr_max、sigma_rms_max 的 AUROC 均应大于 0.8。
+4. **K 复合波判别**：N2 中 YASA 慢波所在秒（多数为 K 复合波）的 so_contrast 中位数应明显高于 N3 秒；N3 秒的 so_contrast 中位数应接近 0。
 
 任何一项不通过，先排查换算、滤波或对齐问题，不进入 T1。
 
@@ -331,7 +345,7 @@ A 必须用逐级独热，不能用码字向量之和。逐级独热等价于语
 
 **步骤**：
 
-1. 用岭回归从 Z 特征（z_{t-3..t}，1,024 维，标准化）预测标准化后的 `D_band`（7 维）与 `D_full`（10 维）。alpha 在 {0.1, 1, 10, 100, 1000} 中用训练折内受试者 3 折选择。报告每一维在评测集上的 R²。
+1. 用岭回归从 Z 特征（z_{t-3..t}，1,024 维，标准化）预测标准化后的 `D_band`（7 维）与 `D_full`（11 维）。alpha 在 {0.1, 1, 10, 100, 1000} 中用训练折内受试者 3 折选择。报告每一维在评测集上的 R²。
 2. 模拟语义码：把预测值 d̂_t 映射到该折 `S_band`（K = 128）k-means 的最近中心，得到 ĉ_t。注意 d̂_t 与中心必须处于同一标准化空间。
 3. 一致性：ĉ_t 与 c_t 的准确率与 AMI。
 4. 用 ĉ_t 代替 c_t 重做 T2（特征 A+Ŝ），计算保留率 = ΔAUPRC(A+Ŝ) / ΔAUPRC(A+S)，只对 T2 通过的任务计算。
@@ -441,7 +455,7 @@ T4 决定论文的主张：通过时可主张下游收益；不通过时主张�
 
 ## 11. 注意事项
 
-1. **循环论证**：`D_full` 的第 8 至 10 维与 YASA 纺锤波判据相同。纺锤波任务一律以 `S_band` 为主结果，`S_full` 只作上限；觉醒与分期为专家标注，是最干净的判据。条件允许时，另用 MASS 或 DREAMS 的专家纺锤波标注复核。
+1. **循环论证**：`D_full` 的第 8 至 10 维与 YASA 纺锤波判据相同；第 11 维与 YASA 慢波检测的幅度判据（0.3-1.5 Hz 带通后的峰峰值）相近，用 YASA 慢波作标签评估它时同样偏乐观。K 复合波的检验应优先使用专家标注（DREAMS K 复合波库或 MASS SS2，需核对可得性）。纺锤波任务一律以 `S_band` 为主结果，`S_full` 只作上限；觉醒与分期为专家标注，是最干净的判据。条件允许时，另用 MASS 或 DREAMS 的专家纺锤波标注复核。
 2. **相同 K**：所有离散化之间的比较必须在同一 K 下进行；NMI、AMI 与 AUPRC 都随 K 变化。
 3. **泄漏**：k-means、全局标准化、PCA、回归与超参数只在训练折拟合；评测集只来自测试折。
 4. **不得事后调阈值**：见第 4 节。
@@ -452,7 +466,7 @@ T4 决定论文的主张：通过时可主张下游收益；不通过时主张�
 
 ## 附录 A：癫痫语义描述子（E1-E6）
 
-> 版本：2026-10-01。在第 3.2 节 10 维描述子之外新增 6 维，使描述子也能表达单通道可见的癫痫样形态。
+> 版本：2026-10-01。在第 3.2 节 11 维描述子之外新增 6 维，使描述子也能表达单通道可见的癫痫样形态。本附录为可选内容，以睡眠为主的研究可以不用。
 
 ### A.1 范围
 
@@ -621,14 +635,14 @@ def epi_descriptors(x_uv, n_seconds, fs=FS):
 
 这 6 维**不做每夜标准化**。若某一夜大部分时间都存在放电（例如睡眠中癫痫性电持续状态），每夜标准化会把放电当作该夜的背景抹掉。E1 已经以局部背景为参照，E2 至 E6 与幅度无关，因此只需要总体参照：在按数据库均衡的训练夜上拟合每维的中位数与四分位距，做稳健标准化。E5 的 NaN 在标准化后填为 0。
 
-### A.5 与现有 10 维的组合
+### A.5 与现有 11 维的组合
 
-在以 NSRR 为主的数据里，这 6 维几乎全是背景噪声。若与现有 10 维等权拼接，会稀释已有的 8 个睡眠微状态簇。推荐做法：
+在以 NSRR 为主的数据里，这 6 维几乎全是背景噪声。若与现有 11 维等权拼接，会稀释已有的 8 个睡眠微状态簇。推荐做法：
 
 1. **超出正常范围的变换**：对 E1、E3、E4、E6 取 u = max(0, z − 2)；E2 只在 E1 或 E3 被触发时保留其 z 值，否则置 0；E5 只在 E4 被触发时保留，否则置 0。正常秒的 6 维全为 0。
-2. **乘积码**：状态码由现有 10 维给出（每夜标准化，k = 8，可加残差层）；事件码由变换后的 6 维单独聚类，K_e 取 8 到 16，另设一个"无事件"码对应全 0。语义 token = (状态码, 事件码)。
+2. **乘积码**：状态码由现有 11 维给出（每夜标准化，k = 8，可加残差层）；事件码由变换后的 6 维单独聚类，K_e 取 8 到 16，另设一个"无事件"码对应全 0。语义 token = (状态码, 事件码)。
 3. **拟合事件码时**：使用含癫痫数据的样本（TUEV、TUSZ 与 NSRR 混合），并按 Σu 的分位数分层过采样。否则 k-means 不会给罕见事件分配码字。
-4. **若必须用单一向量**：拼接 10 维与变换后的 6 维。正常秒新增维为 0，原有簇结构应基本不变，需按 EA4 验证。
+4. **若必须用单一向量**：拼接 11 维与变换后的 6 维。正常秒新增维为 0，原有簇结构应基本不变，需按 EA4 验证。
 5. **若语义层用 RVQ**：事件码本不参与死码替换（Hypnos 量化器把使用量低于平均 10% 的码字当作死码替换，见 `quantizer.py:192`），或改用 FSQ。
 
 ### A.6 免训练验证
