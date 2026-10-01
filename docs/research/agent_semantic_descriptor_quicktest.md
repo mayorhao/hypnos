@@ -73,13 +73,41 @@
 
 ### 3.1 µV 域信号
 
-描述子在 µV 域计算，不在滚动 z-score 后的归一化域计算，因为滚动归一化会抹掉整夜的功率变化。换算方式与第 8 节相同：
+描述子在 µV 域计算，不在滚动 z-score 后的归一化域计算，因为滚动归一化会抹掉整夜的功率变化：在合成测试中，N3 相对 N2 的 delta 功率在 µV 域为 9.3 dB，在归一化域只剩 0.9 dB。
+
+**首选**：若能从 EDF 重跑，直接用 `hypnos.data.nsrr.causal_filter` 得到因果滤波后的 µV 信号，不需要换算。
+
+**否则从已保存的 `signal` 与 `log_scale` 换算。** 预处理的顺序是：因果滤波，逐样本滚动 z-score（τ = 60 s），8σ 以上对数压缩（拐点 8、尺度 2）。`nsrr.py` 只保存了每秒最后一个样本的 σ 的自然对数。换算步骤：
 
 ```text
-x_uV[n] = x_proc[n] * exp(log_scale[t]),  t = floor(n / 128)
+1. 撤销压缩：u = y                                           若 |y| <= 8
+             u = sign(y) * (8 + 2 * (exp((|y| - 8) / 2) - 1))  若 |y| > 8
+2. log_scale[t] 对应样本 t*128 + 127；对 log σ 在这些锚点之间线性插值，得到逐样本 σ(n)
+3. x_uV[n] = u[n] * σ(n)        （滚动均值 μ 在 0.5 Hz 高通后接近 0，可忽略）
 ```
 
-压缩拐点在 8σ，这一换算在拐点以下是精确的。
+```python
+def to_uv(x_proc, log_scale, fs=128, knee=8.0, scale=2.0):
+    """Invert amplitude compression and rolling normalisation using per-second log sigma (anchored at the
+    last sample of each second, as stored by hypnos.data.nsrr)."""
+    y = np.asarray(x_proc, dtype=np.float64)
+    u = y.copy()
+    m = np.abs(y) > knee
+    u[m] = np.sign(y[m]) * (knee + scale * (np.exp((np.abs(y[m]) - knee) / scale) - 1.0))
+    n = len(log_scale)
+    anchors = np.arange(n) * fs + fs - 1
+    sigma = np.exp(np.interp(np.arange(len(y)), anchors, log_scale))
+    return u * sigma
+```
+
+合成测试中的误差（相对于精确的逐样本 σ）：
+
+| 换算方式 | 频带功率误差，干净段 p99 | 频带功率误差，伪迹秒最大 | so_contrast 误差，K 复合波秒最大 |
+|---|---|---|---|
+| 旧公式：x_proc * exp(log_scale[floor(n/128)]) | 0.17 dB | 3.19 dB | 0.016 |
+| 上述换算 | 0.026 dB | 0.22 dB | 0.003 |
+
+**使用前核对**：本地预处理的 `log_scale` 是否与 `nsrr.py` 相同（自然对数、每秒最后一个样本的 σ）；若是 log10 或整秒平均 σ，需相应修改。抽一夜检查：换算结果与 `causal_filter` 输出在 60 s 窗上的标准差之比应接近 1。单位只有在 EDF 单位换算成功（元数据 `microvolts` 为 true）时才是 µV；11 维描述子做每夜标准化，对一夜内恒定的增益不敏感，但 YASA 等依赖绝对幅度阈值的检测会受影响。
 
 ### 3.2 描述子定义
 
