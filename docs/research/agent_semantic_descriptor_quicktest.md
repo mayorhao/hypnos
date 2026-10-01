@@ -2,7 +2,7 @@
 
 > 用途：把本文件整体交给执行 agent。它规定描述子的精确定义、每个实验的设置、预注册的通过标准和输出格式。
 > 背景：实验 1.2 发现 Hypnos 的 8 级 RVQ token（`eeg-q8-causal`，码本 2048，约 88 bit/s）在 alpha 及以上频段丢失信息，纺锤波事件级 F1 只有 0.76。计划在 split RVQ 中加入 HuBERT 式语义层：第一轮用逐秒描述子做 k-means 得到伪标签，再让语义分支对齐这些目标。本任务在不训练任何神经网络的前提下，判断这个方向是否值得推进。
-> 版本：2026-09-30
+> 版本：2026-09-30；2026-10-01 增加附录 A（癫痫语义描述子 E1-E6）
 
 ---
 
@@ -447,3 +447,198 @@ T4 决定论文的主张：通过时可主张下游收益；不通过时主张�
 4. **不得事后调阈值**：见第 4 节。
 5. **记录**：在 README 中写明软件版本（numpy、scipy、sklearn、YASA）、运行时间、实际路径、随机种子，以及与本文的任何偏差。
 6. **失败也要报告**：任何测试不通过时，照常输出完整数值，不要删减或替换指标。
+
+---
+
+## 附录 A：癫痫语义描述子（E1-E6）
+
+> 版本：2026-10-01。在第 3.2 节 10 维描述子之外新增 6 维，使描述子也能表达单通道可见的癫痫样形态。
+
+### A.1 范围
+
+- **表达的对象**：孤立棘波或尖波、棘慢波节律、周期性放电、节律性发作样活动。
+- **每一维只描述形态类别，不判定是否为癫痫。** 睡眠中的良性尖锐瞬变（顶尖波、睡眠良性癫痫样瞬变 BETS、POSTS）会落在相近区域；能否判为癫痫样放电，取决于电场分布与上下文，由语言模型的跨通道注意力承担。
+- **采样率**：128 Hz 下，棘波的一个半波只有 2 到 4 个样本，分辨率有限。原始采样率不低于 200 Hz 的数据（例如 TUH 的 250 Hz）应在原始采样率上计算这 6 维；描述子只作训练目标，不需要与 tokenizer 同采样率。SHHS 的 EEG 为 125 Hz，只能用 128 Hz。
+- **不在范围内**：高频振荡（HFO）；发作后低幅压抑由尺度流 `log_scale` 表达，不由这 6 维表达。
+
+### A.2 定义
+
+所有计算在 µV 域（第 3.1 节）进行。核心原语是带迟滞阈值的半波分解：信号反向变化超过阈值 δ 才确认一个转折点，δ 取"过去 30 s 内每秒稳健标准差（1.4826 × MAD）的中位数"的 0.5 倍。每个半波记录起止样本、幅度、时长与斜率（幅度 / 时长），归属到其终点所在的秒。
+
+| 编号 | 名称 | 定义 | 主要针对 |
+|---|---|---|---|
+| E1 | sharp_contrast | 第 t 秒内幅度最大的半波的斜率，除以"该量在过去 30 s 的中位数"，取 log10 | 孤立棘波、尖波 |
+| E2 | halfwave_ms | 同一半波的时长（ms），取 log10 | 区分棘波（约 10 至 35 ms）、尖波与顶尖波（约 35 至 100 ms）、K 复合波与慢波（数百 ms） |
+| E3 | kurtosis | 第 t 秒原始信号的超额峰度，与尺度无关 | 尖锐瞬变、棘慢波 |
+| E4 | rhythm_strength | 1 至 20 Hz 零相位带通信号在过去 4 s 窗内的自相关：取第一个过零点之后、滞后 0.05 至 1 s 内的最高峰值 | 持续的节律性活动 |
+| E5 | rhythm_freq | 在不低于最高峰 0.9 倍的峰中取最短滞后，频率 = 1 / 滞后；E4 低于 0.4 时记为 NaN | 3 Hz 棘慢波、发作期主频及其演变 |
+| E6 | periodicity | 以 0.125 s 为一格，每格取"所有半波斜率对比度"的最大值并取 log1p；在过去 8 s 上计算自相关，取滞后 0.25 至 4 s 的最大值 | 周期性放电、棘慢波串 |
+
+说明：
+
+- E1 选秒内幅度最大的半波，而不是最陡的半波。选最陡的半波会被背景中的小抖动主导，K 复合波测出的时长只有约 23 ms，测试中已经出现过。
+- E5 取近最高峰中的最短滞后，是为了避免选到次谐波。测试中按最高峰取值，3 Hz 棘慢波被测成 1.5 Hz。
+- E1 以过去 30 s 为参照，所以在持续放电中会下降，这时由 E3、E4、E6 承担。合成测试中棘慢波串的 E1 为 0.37，而 E3、E4、E6 分别为 3.25、0.63、0.68。
+- E4 至 E6 使用零相位滤波或尾随窗，前瞻不超过数百毫秒；描述子只作训练目标，这可以接受。
+
+**参考实现**（单通道，8 小时一夜约 7 s）：
+
+```python
+import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+from scipy.signal import butter, sosfiltfilt
+from scipy.stats import kurtosis
+
+FS = 128
+
+
+def _trailing_median(v, n):
+    """Median over the trailing n values (inclusive); the first n-1 entries use the available prefix."""
+    out = np.empty(len(v))
+    if len(v) >= n:
+        out[n - 1 :] = np.median(sliding_window_view(v, n), axis=1)
+    for i in range(min(n - 1, len(v))):
+        out[i] = np.median(v[: i + 1])
+    return out
+
+
+def half_waves(x, delta):
+    """Hysteresis (zig-zag) half-wave decomposition. delta: per-sample reversal threshold (uV).
+    Returns arrays (start_idx, end_idx, amplitude) for consecutive turning points."""
+    tps = [0]
+    direction = 1 if x[1] >= x[0] else -1
+    ext, ext_i = x[0], 0
+    for i in range(1, len(x)):
+        v = x[i]
+        if direction > 0:
+            if v > ext:
+                ext, ext_i = v, i
+            elif ext - v > delta[i]:
+                tps.append(ext_i)
+                direction, ext, ext_i = -1, v, i
+        else:
+            if v < ext:
+                ext, ext_i = v, i
+            elif v - ext > delta[i]:
+                tps.append(ext_i)
+                direction, ext, ext_i = 1, v, i
+    tps = np.asarray(tps)
+    return tps[:-1], tps[1:], np.abs(np.diff(x[tps]))
+
+
+def epi_descriptors(x_uv, n_seconds, fs=FS):
+    """(n_seconds, 6): sharp_contrast, sharp_halfwave_ms (log10), kurtosis, rhythm_strength, rhythm_freq, periodicity.
+    rhythm_freq is NaN when rhythm_strength < 0.4."""
+    x = np.asarray(x_uv[: n_seconds * fs], dtype=np.float64)
+    out = np.full((n_seconds, 6), np.nan, np.float32)
+    seg = x.reshape(n_seconds, fs)
+
+    # Hysteresis threshold: 0.5 x robust std, from the median of per-second robust std over the trailing 30 s.
+    rstd = 1.4826 * np.median(np.abs(seg - np.median(seg, 1, keepdims=True)), 1)
+    delta = np.repeat(0.5 * _trailing_median(rstd, 30), fs)
+    s, e, amp = half_waves(x, delta)
+    dur = (e - s) / fs
+    slope = amp / np.maximum(dur, 1.0 / fs)  # uV/s
+    apex_sec = e // fs
+
+    # 1-2) largest-amplitude half-wave whose apex falls in second t: its slope contrast vs the trailing-30 s
+    #      median of the same per-second quantity, and its duration.
+    order = np.argsort(apex_sec, kind="stable")
+    sec_sorted = apex_sec[order]
+    bounds = np.searchsorted(sec_sorted, np.arange(n_seconds + 1))
+    big_slope = np.full(n_seconds, np.nan)
+    big_dur = np.full(n_seconds, np.nan)
+    for t in range(n_seconds):
+        idx = order[bounds[t] : bounds[t + 1]]
+        if idx.size:
+            j = idx[int(np.argmax(amp[idx]))]
+            big_slope[t], big_dur[t] = slope[j], dur[j]
+    bg = _trailing_median(np.nan_to_num(big_slope, nan=np.nanmedian(big_slope)), 30)
+    out[:, 0] = np.log10(big_slope / (bg + 1e-9))
+    out[:, 1] = np.log10(1000.0 * big_dur)
+    # per 0.125 s bin: max slope contrast over all half-waves ending in the bin (input to periodicity)
+    best_bin = np.zeros(n_seconds * 8)
+    valid = apex_sec < n_seconds
+    c_all = slope[valid] / (bg[apex_sec[valid]] + 1e-9)
+    np.maximum.at(best_bin, (e[valid] * 8) // fs, c_all)
+
+    # 3) excess kurtosis of the 1 s segment (scale-invariant spikiness).
+    out[:, 2] = kurtosis(seg, axis=1, fisher=True)
+
+    # 4-5) rhythmicity: first autocorrelation peak (after the first zero crossing) of the 1-20 Hz signal,
+    #      trailing 4 s window, lags 0.05-1 s.
+    xb = sosfiltfilt(butter(4, [1.0, 20.0], "bandpass", fs=fs, output="sos"), x)
+    win, lo, hi = 4 * fs, int(0.05 * fs), fs
+    for t in range(3, n_seconds):
+        w = xb[(t + 1) * fs - win : (t + 1) * fs]
+        w = w - w.mean()
+        full = np.correlate(w, w, "full")[win - 1 :]
+        r = full[: hi + 2] / (full[0] + 1e-12)
+        zc = np.flatnonzero(r[1:] < 0)
+        if zc.size == 0:
+            continue
+        start = max(lo, zc[0] + 1)
+        seg_r = r[start : hi + 1]
+        if seg_r.size < 3:
+            continue
+        pk = np.flatnonzero((seg_r[1:-1] >= seg_r[:-2]) & (seg_r[1:-1] >= seg_r[2:])) + 1
+        if pk.size == 0:
+            continue
+        top = seg_r[pk].max()
+        k = pk[np.flatnonzero(seg_r[pk] >= 0.9 * top)[0]]  # shortest lag among near-maximal peaks (avoid subharmonics)
+        out[t, 3] = top
+        out[t, 4] = fs / (start + k) if top >= 0.4 else np.nan
+
+    # 6) periodicity of sharp transients: autocorrelation of the per-bin max slope contrast,
+    #    trailing 8 s (64 bins), lags 0.25-4 s, max.
+    L, lags = 64, np.arange(2, 33)
+    sb = np.log1p(best_bin)
+    for t in range(7, n_seconds):
+        v = sb[(t + 1) * 8 - L : (t + 1) * 8]
+        v = (v - v.mean()) / (v.std() + 1e-12)
+        out[t, 5] = max(np.mean(v[:-k] * v[k:]) for k in lags)
+    return out
+```
+
+### A.3 合成信号上的检验
+
+背景为 1/f 型噪声（约 30 µV）；插入纺锤波、K 复合波、顶尖波、孤立棘波加后随慢波、3 Hz 棘慢波串（12 s）、约 1 Hz 周期性放电（15 s）、6 Hz 渐变到 3 Hz 且幅度递增的节律性发作样活动（30 s）。表中为各类事件所在秒的中位数，halfwave 已换算为 ms：
+
+| 事件 | E1 尖锐对比 | E2 半波 ms | E3 峰度 | E4 节律强度 | E5 节律频率 Hz | E6 周期性 |
+|---|---|---|---|---|---|---|
+| 背景 | -0.02 | 141 | -0.59 | 0.28 | 无 | 0.28 |
+| 纺锤波 | 0.63 | 39 | -0.49 | 0.19 | 无 | 0.23 |
+| K 复合波 | 0.16 | 282 | -0.84 | 0.38 | 无 | 0.24 |
+| 顶尖波 | 0.41 | 71 | 0.36 | 0.27 | 无 | 0.31 |
+| 孤立棘波 | 1.16 | 15 | 1.16 | 0.31 | 无 | 0.29 |
+| 3 Hz 棘慢波 | 0.37 | 148 | 3.25 | 0.63 | 3.05 | 0.68 |
+| 1 Hz 周期性放电 | 0.53 | 71 | 0.09 | 0.17 | 无 | 0.44 |
+| 节律性发作样活动 | 0.23 | 112 | -1.01 | 0.74 | 4.27 | 0.34 |
+
+"无"表示多数秒因 E4 低于 0.4 被置为 NaN。合成信号只验证每一维对目标形态有响应，阈值和效应量必须在真实数据上重新确定。
+
+### A.4 归一化
+
+这 6 维**不做每夜标准化**。若某一夜大部分时间都存在放电（例如睡眠中癫痫性电持续状态），每夜标准化会把放电当作该夜的背景抹掉。E1 已经以局部背景为参照，E2 至 E6 与幅度无关，因此只需要总体参照：在按数据库均衡的训练夜上拟合每维的中位数与四分位距，做稳健标准化。E5 的 NaN 在标准化后填为 0。
+
+### A.5 与现有 10 维的组合
+
+在以 NSRR 为主的数据里，这 6 维几乎全是背景噪声。若与现有 10 维等权拼接，会稀释已有的 8 个睡眠微状态簇。推荐做法：
+
+1. **超出正常范围的变换**：对 E1、E3、E4、E6 取 u = max(0, z − 2)；E2 只在 E1 或 E3 被触发时保留其 z 值，否则置 0；E5 只在 E4 被触发时保留，否则置 0。正常秒的 6 维全为 0。
+2. **乘积码**：状态码由现有 10 维给出（每夜标准化，k = 8，可加残差层）；事件码由变换后的 6 维单独聚类，K_e 取 8 到 16，另设一个"无事件"码对应全 0。语义 token = (状态码, 事件码)。
+3. **拟合事件码时**：使用含癫痫数据的样本（TUEV、TUSZ 与 NSRR 混合），并按 Σu 的分位数分层过采样。否则 k-means 不会给罕见事件分配码字。
+4. **若必须用单一向量**：拼接 10 维与变换后的 6 维。正常秒新增维为 0，原有簇结构应基本不变，需按 EA4 验证。
+5. **若语义层用 RVQ**：事件码本不参与死码替换（Hypnos 量化器把使用量低于平均 10% 的码字当作死码替换，见 `quantizer.py:192`），或改用 FSQ。
+
+### A.6 免训练验证
+
+| 编号 | 检验 | 做法 | 建议的通过标准 |
+|---|---|---|---|
+| EA1 | 合成自检 | 复现 A.3 的方向：棘波 E1 高、E2 短、E3 高；棘慢波 E3、E4、E6 高且 E5 约 3 Hz；发作样活动 E4 高；K 复合波 E2 长、E1 低 | 方向全部一致 |
+| EA2 | TUEV 判别 | 按事件标注所在导联取秒（TUEV 的标注基于 TCP 双极导联，需核对），比较 6 类（棘波或尖波、广泛性周期性放电、单侧周期性放电、眼动、伪迹、背景）的分布；报告每维在"棘波对背景""棘波对伪迹""周期性放电对背景"上的 AUROC，以及事件码在各类中的富集 | 棘波对背景：E1 或 E3 的 AUROC 至少 0.85；周期性放电对背景：E6 的 AUROC 至少 0.75 |
+| EA3 | 健康睡眠假阳性 | 在多数据库的 200 个训练夜上，按分期统计事件码不为"无事件"的秒所占比例，特别关注 N1 与 N2（顶尖波、K 复合波多）和 W（伪迹多） | 睡眠期合计不超过 2%；超过时检查是否主要来自顶尖波或伪迹 |
+| EA4 | 不破坏睡眠结构 | 采用单一向量时，重新做 k = 8 聚类，与原 8 个簇比较 | ARI 至少 0.8；C3 的纺锤波召回、C6 加 C7 的慢波召回、C0 的觉醒富集变化不超过 5 个百分点 |
+| EA5（可选） | 发作 | 在 TUSZ 上比较发作前 60 s、发作期、发作后 60 s 的 E4、E5、E6 与 log_scale | E4 在发作期高于发作前；发作后 log_scale 下降 |
+
+通过标准为建议值，应在运行前写入 `prereg.json` 的 `"EA"` 条目并固定。
